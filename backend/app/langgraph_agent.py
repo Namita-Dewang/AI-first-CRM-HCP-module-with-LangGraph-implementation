@@ -15,7 +15,7 @@ import uuid
 import os
 from datetime import datetime
 from typing import Annotated, Optional, TypedDict
-from groq import BadRequestError
+from groq import BadRequestError, RateLimitError
 from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from langgraph.checkpoint.memory import MemorySaver
@@ -29,6 +29,7 @@ from .models import HCP, FollowUpTask, Interaction
 
 SAMPLE_ANNUAL_LIMIT = 10  # illustrative PDMA-style cap per HCP per product per year
 FUNCTION_LEAK_RE = re.compile(r"<function=(\w+)>(\{.*?\})</function>", re.DOTALL)
+SUGGESTION_RE = re.compile(r"^SUGGESTION:\s*(.+)$", re.MULTILINE)
 APPROVED_MATERIALS = [
     "OncoBoost Phase III PDF",
     "OncoBoost Efficacy One-Pager",
@@ -55,6 +56,7 @@ class InteractionState(TypedDict):
     outcomes: Optional[str]
     follow_up_actions: list[str]
     compliance_flags: list[str]
+    ai_suggested_follow_ups: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +95,7 @@ def get_hcp_context(hcp_name_query: str) -> dict:
 
 
 @tool
-def recommend_compliant_content(hcp_id: str, topics: list[str], proposed_samples: Optional[list[dict]] = None) -> dict:
+def recommend_compliant_content(hcp_id: str, topics: list[str] = [], proposed_samples: Optional[list[dict]] = None) -> dict:
     """Given topics discussed and any samples the rep wants to distribute,
     returns MLR-approved materials to suggest and checks sample compliance
     against the annual per-HCP limit. Call this BEFORE log_interaction
@@ -250,7 +252,10 @@ def tools_node(state: InteractionState):
     patch = {}
 
     for call in last_message.tool_calls:
-        result = TOOL_MAP[call["name"]].invoke(call["args"])
+        try:
+            result = TOOL_MAP[call["name"]].invoke(call["args"])
+        except Exception as e:
+            result = {"status": "error", "message": f"Tool call failed: {e}"}
         tool_messages.append(ToolMessage(content=str(result), tool_call_id=call["id"], name=call["name"]))
 
         if call["name"] == "get_hcp_context" and result.get("found"):
@@ -305,7 +310,7 @@ def tools_node(state: InteractionState):
     patch["messages"] = tool_messages
     return patch
 
-SYSTEM_PROMPT = """You are a field-rep assistant for a pharmaceutical CRM.
+SYSTEM_PROMPT = SYSTEM_PROMPT = SYSTEM_PROMPT = """You are a field-rep assistant for a pharmaceutical CRM.
 You help log and edit HCP interactions from natural language, and you keep
 the rep compliant. Always call get_hcp_context first when an HCP is named.
 If get_hcp_context returns found=False, do NOT ask the rep for an ID —
@@ -318,12 +323,35 @@ ineligible without warning the rep.
 Only these exact field names exist: hcp_name, interaction_type, date,
 time, attendees, topics_discussed, materials_shared,
 samples_distributed, sentiment, outcomes, follow_up_actions. Never
-invent other field names (e.g. use "sentiment", not "observed"). Never
-pass literal words like "today" or "now" as a date/time value — omit
-the field if no explicit date/time was stated.
+invent other field names.
 
-Ask a clarifying question rather than guessing if a required field is
-missing or ambiguous. Keep replies short and rep-friendly."""
+NEVER ask the rep for date or time — always omit them and the actual
+current timestamp is used automatically. NEVER ask the rep for
+interaction_type — if it isn't clearly stated, default to "Meeting"
+and log_interaction will handle it, do not ask about it. Extract
+whatever topics_discussed, outcomes, sentiment, materials, or samples
+you can infer from what the rep actually said, even partial
+information, and call log_interaction immediately with what you have.
+
+The ONLY acceptable reason to ask a clarifying question before logging
+is if you cannot determine who the HCP is at all (no name given). For
+everything else — interaction type, date, time, sentiment, exact
+wording of topics — make a reasonable inference from the message and
+log it rather than asking. The rep can always correct details
+afterward with edit_interaction.
+
+Once an interaction has already been logged in this conversation, treat
+any new information the rep provides as a correction and immediately
+call edit_interaction with interaction_id and only the changed fields
+— do not ask further questions about it.
+
+After every successful log_interaction or edit_interaction call, think
+of 2-3 concrete, specific next-step suggestions for the rep based on
+what was just discussed. List them at the very end of your reply, each
+on its own line starting with "SUGGESTION: ". Do not use this format
+at any other time.
+
+Keep replies short and rep-friendly."""
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +396,14 @@ def get_agent_graph():
                 )
             else:
                 response = llm_with_tools.invoke([("system", SYSTEM_PROMPT)] + recent_messages)
+                
+        except RateLimitError as e:
+            response = AIMessage(
+                content=(
+                    "I've hit Groq's rate limit for right now and can't process this message. "
+                    "Please wait a few minutes and try again."
+                )
+            )
         except BadRequestError:
             response = llm.invoke(
                 [("system", SYSTEM_PROMPT + "\n\nRespond with a short plain-text answer only. Do not attempt to call any tools.")]
@@ -402,6 +438,13 @@ def get_agent_graph():
                             "type": "tool_call",
                         }],
                     )
+
+        content = response.content or ""
+        suggestions = SUGGESTION_RE.findall(content)
+        if suggestions and not getattr(response, "tool_calls", None):
+            visible_text = SUGGESTION_RE.sub("", content).strip()
+            response = AIMessage(content=visible_text)
+            return {"messages": [response], "ai_suggested_follow_ups": suggestions[:3]}
 
         return {"messages": [response]}
 

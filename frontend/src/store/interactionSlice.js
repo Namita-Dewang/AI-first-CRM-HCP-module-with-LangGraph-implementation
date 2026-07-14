@@ -12,6 +12,7 @@ const FIELD_MAP = {
   samples_distributed: 'samplesDistributed',
   follow_up_actions: 'followUpActions',
   compliance_flags: 'complianceFlags',
+  ai_suggested_follow_ups: 'aiSuggestedFollowUps',
 }
 
 const initialState = {
