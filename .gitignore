@@ -1,0 +1,6 @@
+backend/venv/
+frontend/node_modules/
+backend/hcp_crm.db
+backend/.env
+frontend/node_modules/
+backend/node_modules/

@@ -1,0 +1,25 @@
+.screen {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 28px 24px 60px;
+}
+
+.screen-title {
+  font-size: 22px;
+  font-weight: 700;
+  margin: 0 0 20px;
+  color: var(--text-primary);
+}
+
+.screen-grid {
+  display: grid;
+  grid-template-columns: 2.15fr 1fr;
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  .screen-grid {
+    grid-template-columns: 1fr;
+  }
+}
